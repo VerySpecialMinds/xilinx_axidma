@@ -66,6 +66,10 @@ struct axidma_device {
     struct axidma_chan *channels;   // All available channels
     struct list_head dmabuf_list;   // List of allocated DMA buffers
     struct list_head external_dmabufs;  // Buffers allocated in other drivers
+
+    /* When true, user buffers are allocated as cached, non-coherent mappings
+     * that require explicit cache maintenance before/after DMA. */
+    bool cached_buffers;
 };
 
 /*----------------------------------------------------------------------------
