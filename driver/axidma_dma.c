@@ -12,6 +12,7 @@
 // Kernel dependencies
 #include <linux/delay.h>            // Milliseconds to jiffies converstion
 #include <linux/wait.h>             // Completion related functions
+#include <linux/dma-mapping.h>      // DMA cache maintenance helpers
 
 /* <linux/signal.h> was moved to <linux/sched/signal.h> in the 4.11 kernel */
 #include <linux/version.h>
@@ -54,6 +55,7 @@ struct axidma_transfer {
     bool wait;                      // Indicates if we should wait
     dma_cookie_t cookie;            // The DMA cookie for the transfer
     struct completion comp;         // A completion to use for waiting
+    struct axidma_device *dev;      // Parent device for sync helpers
     enum axidma_dir dir;            // The direction of the transfer
     enum axidma_type type;          // The type of the transfer (VDMA/DMA)
     int channel_id;                 // The ID of the channel
@@ -70,6 +72,11 @@ struct axidma_transfer {
 // The data to pass to the DMA transfer completion callback function
 struct axidma_cb_data {
     int channel_id;                 // The id of the channel used
+    struct scatterlist *sg_list;    // Buffers involved in the transfer
+    enum dma_data_direction dma_dir;// Direction for cache maintenance
+    int sg_len;                     // Number of scatter-gather entries
+    struct device *dma_dev;         // Device to use for syncing
+    bool cache_sync;                // Whether cache maintenance is required
     int notify_signal;              // For async, signal to send
     struct task_struct *process;    // The process to send the signal to
     struct completion *comp;        // For sync, the notification to kernel
@@ -96,6 +103,40 @@ static enum dma_transfer_direction axidma_to_dma_dir(enum axidma_dir dma_dir)
 {
     BUG_ON(dma_dir != AXIDMA_WRITE && dma_dir != AXIDMA_READ);
     return (dma_dir == AXIDMA_WRITE) ? DMA_MEM_TO_DEV : DMA_DEV_TO_MEM;
+}
+
+static void axidma_sync_sg_for_device(struct axidma_device *dev,
+                                      struct scatterlist *sg_list, int sg_len,
+                                      enum dma_data_direction dir)
+{
+    int i;
+
+    if (!dev->cached_buffers) {
+        return;
+    }
+
+    for (i = 0; i < sg_len; i++)
+    {
+        dma_sync_single_for_device(&dev->pdev->dev, sg_dma_address(&sg_list[i]),
+                                   sg_dma_len(&sg_list[i]), dir);
+    }
+}
+
+static void axidma_sync_sg_for_cpu(struct axidma_cb_data *cb_data)
+{
+    int i;
+
+    if (!cb_data->cache_sync) {
+        return;
+    }
+
+    for (i = 0; i < cb_data->sg_len; i++)
+    {
+        dma_sync_single_for_cpu(cb_data->dma_dev,
+                                sg_dma_address(&cb_data->sg_list[i]),
+                                sg_dma_len(&cb_data->sg_list[i]),
+                                cb_data->dma_dir);
+    }
 }
 
 /*----------------------------------------------------------------------------
@@ -148,6 +189,7 @@ static void axidma_dma_callback(void *data)
     /* For synchronous transfers, notify the kernel thread waiting. For
      * asynchronous transfers, send a signal to userspace if requested. */
     cb_data = data;
+    axidma_sync_sg_for_cpu(cb_data);
     if (cb_data->comp != NULL) {
         complete(cb_data->comp);
     } else if (VALID_NOTIFY_SIGNAL(cb_data->notify_signal)) {
@@ -207,6 +249,7 @@ static int axidma_prep_transfer(struct axidma_chan *axidma_chan,
 
     /* For VDMA transfers, we configure the channel, then prepare an interlaved
      * transfer. For DMA, we simply prepare a slave scatter-gather transfer. */
+    axidma_sync_sg_for_device(dma_tfr->dev, sg_list, sg_len, dma_dir);
     dma_flags = DMA_CTRL_ACK | DMA_PREP_INTERRUPT;
     if (dma_tfr->type == AXIDMA_DMA) {
         dma_txnd = dmaengine_prep_slave_sg(chan, sg_list, sg_len, dma_dir,
@@ -241,6 +284,12 @@ static int axidma_prep_transfer(struct axidma_chan *axidma_chan,
     /* If we're going to wait for this channel, initialize the completion for
      * the channel, and setup the callback to complete it. */
     cb_data->channel_id = dma_tfr->channel_id;
+    cb_data->sg_list = sg_list;
+    cb_data->sg_len = sg_len;
+    cb_data->dma_dir = dma_dir;
+    cb_data->dma_dev = &dma_tfr->dev->pdev->dev;
+    cb_data->cache_sync = dma_tfr->dev->cached_buffers &&
+                          dma_dir == DMA_DEV_TO_MEM;
     if (dma_tfr->wait) {
         cb_data->comp = dma_comp;
         cb_data->notify_signal = -1;
@@ -379,6 +428,7 @@ int axidma_read_transfer(struct axidma_device *dev,
     // Setup receive transfer structure for DMA
     rx_tfr.sg_list = &sg_list;
     rx_tfr.sg_len = 1;
+    rx_tfr.dev = dev;
     rx_tfr.dir = rx_chan->dir;
     rx_tfr.type = rx_chan->type;
     rx_tfr.wait = trans->wait;
@@ -429,6 +479,7 @@ int axidma_write_transfer(struct axidma_device *dev,
     // Setup transmit transfer structure for DMA
     tx_tfr.sg_list = &sg_list;
     tx_tfr.sg_len = 1;
+    tx_tfr.dev = dev;
     tx_tfr.dir = tx_chan->dir;
     tx_tfr.type = tx_chan->type;
     tx_tfr.wait = trans->wait;
@@ -494,6 +545,7 @@ int axidma_rw_transfer(struct axidma_device *dev,
     // Setup receive and trasmit transfer structures for DMA
     tx_tfr.sg_list = &tx_sg_list,
     tx_tfr.sg_len = 1,
+    tx_tfr.dev = dev,
     tx_tfr.dir = tx_chan->dir,
     tx_tfr.type = tx_chan->type,
     tx_tfr.wait = false,
@@ -509,6 +561,7 @@ int axidma_rw_transfer(struct axidma_device *dev,
 
     rx_tfr.sg_list = &rx_sg_list,
     rx_tfr.sg_len = 1,
+    rx_tfr.dev = dev,
     rx_tfr.dir = rx_chan->dir,
     rx_tfr.type = rx_chan->type,
     rx_tfr.wait = trans->wait,
@@ -557,6 +610,7 @@ int axidma_video_transfer(struct axidma_device *dev,
     // Setup transmit transfer structure for DMA
     struct axidma_transfer transfer = {
         .sg_len = trans->num_frame_buffers,
+        .dev = dev,
         .dir = dir,
         .type = AXIDMA_VDMA,
         .wait = false,

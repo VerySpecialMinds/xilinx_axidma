@@ -31,6 +31,10 @@ module_param(chrdev_name, charp, S_IRUGO);
 static int minor_num = MINOR_NUMBER;
 module_param(minor_num, int, S_IRUGO);
 
+// Enable cached, non-coherent DMA buffers to accelerate CPU-side copies.
+static bool cached_buffers;
+module_param(cached_buffers, bool, 0444);
+
 /*----------------------------------------------------------------------------
  * Platform Device Functions
  *----------------------------------------------------------------------------*/
@@ -58,6 +62,7 @@ static int axidma_probe(struct platform_device *pdev)
     axidma_dev->chrdev_name = chrdev_name;
     axidma_dev->minor_num = minor_num;
     axidma_dev->num_devices = NUM_DEVICES;
+    axidma_dev->cached_buffers = cached_buffers;
 
     // Initialize the character device for the module.
     rc = axidma_chrdev_init(axidma_dev);

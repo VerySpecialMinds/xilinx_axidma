@@ -22,6 +22,7 @@
 #include <linux/slab.h>         // Kernel allocation functions
 #include <linux/errno.h>        // Linux error codes
 #include <linux/of_device.h>    // Device tree device related functions
+#include <linux/dma-mapping.h>  // DMA mapping helpers
 
 #include <linux/dma-buf.h>      // DMA shared buffers interface
 #include <linux/scatterlist.h>  // Scatter-gather table definitions
@@ -43,6 +44,7 @@ struct axidma_dma_allocation {
     void *user_addr;            // User virtual address of the buffer
     void *kern_addr;            // Kernel virtual address of the buffer
     dma_addr_t dma_addr;        // DMA bus address of the buffer
+    bool cached_mapping;        // Indicates cached, non-coherent mapping
     struct list_head list;      // List node pointers for allocation list
 };
 
@@ -211,8 +213,13 @@ static void axidma_vma_close(struct vm_area_struct *vma)
     // Get the AXI DMA allocation data and free the DMA buffer
     dev = axidma_dev;
     dma_alloc = vma->vm_private_data;
-    dma_free_coherent(&dev->pdev->dev, dma_alloc->size, dma_alloc->kern_addr,
-                      dma_alloc->dma_addr);
+    if (dma_alloc->cached_mapping) {
+        dma_free_attrs(&dev->pdev->dev, dma_alloc->size, dma_alloc->kern_addr,
+                       dma_alloc->dma_addr, DMA_ATTR_NON_CONSISTENT);
+    } else {
+        dma_free_coherent(&dev->pdev->dev, dma_alloc->size,
+                          dma_alloc->kern_addr, dma_alloc->dma_addr);
+    }
 
     // Remove the allocation from the list, and free the structure
     list_del(&dma_alloc->list);
@@ -276,9 +283,21 @@ static int axidma_mmap(struct file *file, struct vm_area_struct *vma)
     // Configure the DMA device
     of_dma_configure(dev->device, NULL);
 
-    // Allocate the requested region a contiguous and uncached for DMA
-    dma_alloc->kern_addr = dma_alloc_coherent(&dev->pdev->dev, dma_alloc->size,
-                                              &dma_alloc->dma_addr, GFP_KERNEL);
+    /* Allocate the requested region contiguous in CMA. When cached buffers
+     * are requested, use non-coherent mappings and manage cache maintenance
+     * explicitly to speed up CPU-side copies (e.g., writing to storage). */
+    if (dev->cached_buffers) {
+        dma_alloc->kern_addr = dma_alloc_attrs(&dev->pdev->dev,
+                                               dma_alloc->size,
+                                               &dma_alloc->dma_addr,
+                                               GFP_KERNEL,
+                                               DMA_ATTR_NON_CONSISTENT);
+    } else {
+        dma_alloc->kern_addr = dma_alloc_coherent(&dev->pdev->dev,
+                                                  dma_alloc->size,
+                                                  &dma_alloc->dma_addr,
+                                                  GFP_KERNEL);
+    }
     if (dma_alloc->kern_addr == NULL) {
         axidma_err("Unable to allocate contiguous DMA memory region of size "
                    "%zu.\n", dma_alloc->size);
@@ -289,8 +308,14 @@ static int axidma_mmap(struct file *file, struct vm_area_struct *vma)
     }
 
     // Map the region into userspace
-    rc = dma_mmap_coherent(&dev->pdev->dev, vma, dma_alloc->kern_addr,
-                           dma_alloc->dma_addr, dma_alloc->size);
+    if (dev->cached_buffers) {
+        rc = dma_mmap_attrs(&dev->pdev->dev, vma, dma_alloc->kern_addr,
+                            dma_alloc->dma_addr, dma_alloc->size,
+                            DMA_ATTR_NON_CONSISTENT);
+    } else {
+        rc = dma_mmap_coherent(&dev->pdev->dev, vma, dma_alloc->kern_addr,
+                               dma_alloc->dma_addr, dma_alloc->size);
+    }
     if (rc < 0) {
         axidma_err("Unable to remap address %p to userspace address %p, size "
                    "%zu.\n", dma_alloc->kern_addr, dma_alloc->user_addr,
@@ -308,13 +333,20 @@ static int axidma_mmap(struct file *file, struct vm_area_struct *vma)
      * referring to the DMA buffer. */
     vma->vm_flags |= VM_DONTCOPY;
 
+    dma_alloc->cached_mapping = dev->cached_buffers;
+
     // Add the allocation to the driver's list of DMA buffers
     list_add(&dma_alloc->list, &dev->dmabuf_list);
     return 0;
 
 free_dma_region:
-    dma_free_coherent(&dev->pdev->dev, dma_alloc->size, dma_alloc->kern_addr,
-                      dma_alloc->dma_addr);
+    if (dev->cached_buffers) {
+        dma_free_attrs(&dev->pdev->dev, dma_alloc->size, dma_alloc->kern_addr,
+                       dma_alloc->dma_addr, DMA_ATTR_NON_CONSISTENT);
+    } else {
+        dma_free_coherent(&dev->pdev->dev, dma_alloc->size,
+                          dma_alloc->kern_addr, dma_alloc->dma_addr);
+    }
 free_vma_data:
     kfree(dma_alloc);
 ret:
